@@ -1,10 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException
+from fastapi.responses import Response
 from sqlalchemy.orm import Session
 from typing import Optional
 from pydantic import BaseModel
+from urllib.parse import quote
+import re
 from app.database import get_db
 from app.services import item_service, project_service, question_service
 from app.services.ai_service import ai_service
+from app.services.export_service import export_to_word
 from app.prompts import doc_generation, knowledge_base
 
 router = APIRouter(prefix="/api/items", tags=["generation"])
@@ -69,8 +73,7 @@ def generate_documentation(
         generated_content = ai_service.generate_structured_response(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            response_format=response_schema,
-            temperature=0.7
+            response_format=response_schema
         )
 
         # Update the item with generated content
@@ -125,8 +128,7 @@ def regenerate_documentation(
         generated_content = ai_service.generate_structured_response(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            response_format=response_schema,
-            temperature=0.7
+            response_format=response_schema
         )
 
         # Update the item with regenerated content
@@ -142,15 +144,26 @@ def regenerate_documentation(
         raise HTTPException(status_code=500, detail=f"Failed to regenerate documentation: {str(e)}")
 
 
+def sanitize_filename(name: str) -> str:
+    """
+    Sanitize a string for use in a filename.
+    Removes or replaces characters that are invalid in filenames.
+    """
+    # Replace characters that are invalid in filenames
+    invalid_chars = r'[<>:"/\\|?*]'
+    sanitized = re.sub(invalid_chars, '_', name)
+    # Remove leading/trailing spaces and dots
+    sanitized = sanitized.strip(' .')
+    return sanitized
+
+
 @router.get("/{item_id}/export")
 def export_documentation(
     item_id: int,
     db: Session = Depends(get_db)
 ):
     """
-    Export documentation as Word document.
-
-    This is a placeholder endpoint. Full export functionality will be implemented in Phase 5.
+    Export documentation as Word document (.docx).
     """
     item = item_service.get_item(db, item_id)
     if not item:
@@ -159,11 +172,50 @@ def export_documentation(
     if not item.generated_content:
         raise HTTPException(status_code=400, detail="No generated content to export")
 
-    return {
-        "message": "Word export will be implemented in Phase 5",
-        "item_id": item_id,
-        "title": item.title
-    }
+    # Get the project for filename
+    project = project_service.get_project(db, item.project_id)
+    if not project:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    try:
+        # Prepare item data for export
+        item_data = {
+            "title": item.title,
+            "description": item.description,
+            "type": item.type.value
+        }
+
+        # Generate Word document
+        buffer = export_to_word(item_data, item.generated_content, item.type.value)
+
+        # Read the complete content from the buffer
+        content = buffer.getvalue()
+
+        # Create filename: project_name - documentation_name.docx
+        project_name = sanitize_filename(project.name)
+        item_title = sanitize_filename(item.title)
+        filename = f"{project_name} - {item_title}.docx"
+
+        # Create Content-Disposition header with RFC 5987 encoding for non-ASCII characters
+        # filename* uses UTF-8 encoding, filename is ASCII fallback
+        ascii_filename = filename.encode('ascii', 'replace').decode('ascii')
+        encoded_filename = quote(filename, safe='')
+
+        content_disposition = (
+            f"attachment; "
+            f"filename=\"{ascii_filename}\"; "
+            f"filename*=UTF-8''{encoded_filename}"
+        )
+
+        # Return as Response with complete content (not streaming)
+        return Response(
+            content=content,
+            media_type="application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+            headers={"Content-Disposition": content_disposition}
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Failed to export document: {str(e)}")
 
 
 def _update_knowledge_base(db: Session, project, item, questions, generated_content):
@@ -197,8 +249,7 @@ def _update_knowledge_base(db: Session, project, item, questions, generated_cont
         kb_response = ai_service.generate_structured_response(
             system_prompt=system_prompt,
             user_prompt=user_prompt,
-            response_format=response_schema,
-            temperature=0.5
+            response_format=response_schema
         )
 
         # Update the project's knowledge base
